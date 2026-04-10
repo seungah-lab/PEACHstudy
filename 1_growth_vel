@@ -1,0 +1,380 @@
+# =============================================================================
+# Puberty Timing & Growth Analysis (example data: PSKC + MOCHE of Korea)
+# =============================================================================
+
+# Load required packages
+library(tidyverse)
+library(survival)   # For AFT models
+library(corrplot)   # For heatmaps
+library(broom)      # For tidying model outputs
+library(patchwork)  # For plot layout
+
+# --- 0. LOAD DATA & SETTINGS ---
+DATA_PATH <- ".../Final datasets/imputed_final_dataset.csv"
+OUTPUT_DIR <- ".../Outputs"
+
+df_pooled <- read_csv(DATA_PATH)
+
+# Define Variable Groups
+CONT_VARS <- c("ga", "m_age", "m_ht", "m_pre1_wt", "m_pre2_wt", "m_diff_wt", 
+               "birth_wt", "birth_ht", "ponderal_index", "b_wt", "b_ht", 
+               "b1_wt", "b1_ht", "b2_wt", "b2_ht", "b5_wt", "b5_ht", "puberty_age")
+
+CAT_VARS <- c("boy", "cs", "first_order", "m_univ", "f_univ", "m_employed", 
+              "f_employed", "m_smoking_preg", "f_smoking", "event","b3_rural")
+
+BASE_COVARIATES <- c("ga", "m_age", "birth_wt", "birth_ht", "ponderal_index", "m_diff_wt",
+                     "cs", "first_order", "m_univ", "f_univ", "m_employed", "f_employed",
+                     "m_smoking_preg", "f_smoking", "b3_rural")
+
+VEL_VARS <- c("vel_wt_early_inf", "vel_ht_early_inf", "vel_wt_late_inf", 
+              "vel_ht_late_inf", "vel_wt_early_ch", "vel_ht_early_ch")
+
+# =============================================================================
+# Table 1. DESCRIPTIVE TABLES
+# =============================================================================
+
+get_summary <- function(data, label) {
+  # --- Continuous Variables ---
+  cont_vars_present <- intersect(names(data), CONT_VARS)
+  
+  cont_summ <- data %>%
+    select(all_of(cont_vars_present)) %>%
+    summarise(across(everything(), list(
+      Mean = ~mean(., na.rm=T), 
+      SD = ~sd(., na.rm=T), 
+      Median = ~median(., na.rm=T), 
+      Missing = ~sum(is.na(.)),
+      PctMiss = ~round(100 * sum(is.na(.)) / n(), 1)
+    ))) %>%
+    # Use names_pattern to capture everything BEFORE the last underscore as the variable name
+    # and everything AFTER the last underscore as the statistic.
+    pivot_longer(everything(), 
+                 names_to = c("Variable", ".value"), 
+                 names_pattern = "(.*)_(Mean|SD|Median|Missing|PctMiss)")
+  
+  # --- Categorical Variables ---
+  cat_vars_present <- intersect(names(data), CAT_VARS)
+  
+  cat_summ_list <- lapply(cat_vars_present, function(v) {
+    n_total <- nrow(data)
+    n_miss <- sum(is.na(data[[v]]))
+    n_valid <- n_total - n_miss
+    pct_miss <- round(100 * n_miss / n_total, 1)
+    
+    # Calculate frequencies for valid (non-missing) data
+    freqs <- data %>%
+      filter(!is.na(!!sym(v))) %>%
+      group_by(!!sym(v)) %>%
+      summarise(n = n(), .groups = 'drop') %>%
+      mutate(pct = round(100 * n / n_valid, 1),
+             entry = paste0(!!sym(v), ": ", n, " (", pct, "%)")) %>%
+      summarise(Frequencies = paste(entry, collapse = "; "))
+    
+    data.frame(
+      Variable = v,
+      Mean = NA, SD = NA, Median = NA, # Placeholders to match continuous table
+      Missing = n_miss,
+      PctMiss = pct_miss,
+      Frequencies = freqs$Frequencies
+    )
+  })
+  
+  cat_summ <- bind_rows(cat_summ_list)
+  
+  # --- Combine Both ---
+  bind_rows(
+    cont_summ %>% mutate(Type = "Continuous"),
+    cat_summ %>% mutate(Type = "Categorical")
+  ) %>% 
+    mutate(Cohort = label) %>%
+    select(Cohort, Variable, Type, Mean, SD, Median, Missing, PctMiss, Frequencies)
+}
+
+tbl_all   <- get_summary(df_pooled, "Combined")
+
+# Final combined descriptive table
+write_csv(tbl_all, file.path(OUTPUT_DIR, "1_descriptive_table_with_R.csv"))
+
+# =============================================================================
+# Figure S1. PAIRWISE ASSOCIATIONS
+# =============================================================================
+
+plot_corr <- function(data, title, filename) {
+  cor_mat <- cor(data %>% select(all_of(intersect(names(.), CONT_VARS))), use = "pairwise.complete.obs")
+  png(file.path(OUTPUT_DIR, filename), width = 800, height = 800)
+  corrplot(cor_mat, method = "color", type = "upper", title = title, 
+           mar=c(0,0,1,0), tl.col="black", tl.srt=45, addCoef.col = "black", number.cex = 0.7)
+  dev.off()
+}
+
+# Save the correlation plots at Output folder
+plot_corr(df_pooled, "All Samples", "3a_corrmap_all.png")
+plot_corr(filter(df_pooled, boy == 1), "Boys", "3b_corrmap_boys.png")
+plot_corr(filter(df_pooled, boy == 0), "Girls", "3c_corrmap_girls.png")
+
+# =============================================================================
+# Table 2. G-estimation of structural nested accelerated failure-time (SNAFT) model
+# =============================================================================
+
+run_snaft <- function(data, sex_label) {
+  # Subset by sex
+  sub_df <- data %>% 
+    filter(boy == ifelse(sex_label == "Boys", 1, 0)) %>% 
+    drop_na(time, event, all_of(VEL_VARS), all_of(BASE_COVARIATES))
+  
+  if(nrow(sub_df) < 50) return(NULL)
+  
+  # Calculate SDs for 1-SD Time Ratio interpretation
+  sds <- sub_df %>% summarise(across(all_of(VEL_VARS), sd))
+  
+  # --- Step 1: Period C (Early Childhood) ---
+  # Model: log(T) ~ Vel_C + Vel_B + Vel_A + Covariates
+  formula_c <- as.formula(paste("Surv(time, event) ~", 
+                                paste(c(VEL_VARS, BASE_COVARIATES), collapse = " + ")))
+  fit_c <- survreg(formula_c, data = sub_df, dist = "lognormal")
+  
+  psi_c_wt <- coef(fit_c)["vel_wt_early_ch"]
+  psi_c_ht <- coef(fit_c)["vel_ht_early_ch"]
+  
+  # --- Step 2: Compute Counterfactual U_B ---
+  # U_B represents the puberty time if childhood growth had been zero
+  sub_df$U_B <- sub_df$time * exp(-(psi_c_wt * sub_df$vel_wt_early_ch + 
+                                      psi_c_ht * sub_df$vel_ht_early_ch))
+  
+  # --- Step 3: Period B (Late Infancy) ---
+  # Model: log(U_B) ~ Vel_B + Vel_A + Covariates
+  formula_b <- as.formula(paste("Surv(U_B, event) ~", 
+                                paste(c(VEL_VARS[1:4], BASE_COVARIATES), collapse = " + ")))
+  fit_b <- survreg(formula_b, data = sub_df, dist = "lognormal")
+  
+  psi_b_wt <- coef(fit_b)["vel_wt_late_inf"]
+  psi_b_ht <- coef(fit_b)["vel_ht_late_inf"]
+  
+  # --- Step 4: Compute Counterfactual U_A ---
+  sub_df$U_A <- sub_df$U_B * exp(-(psi_b_wt * sub_df$vel_wt_late_inf + 
+                                     psi_b_ht * sub_df$vel_ht_late_inf))
+  
+  # --- Step 5: Period A (Early Infancy) ---
+  formula_a <- as.formula(paste("Surv(U_A, event) ~", 
+                                paste(c(VEL_VARS[1:2], BASE_COVARIATES), collapse = " + ")))
+  fit_a <- survreg(formula_a, data = sub_df, dist = "lognormal")
+  
+  # --- Collect and Format Results ---
+  res_list <- list(
+    tidy(fit_a) %>% filter(term %in% VEL_VARS[1:2]),
+    tidy(fit_b) %>% filter(term %in% VEL_VARS[3:4]),
+    tidy(fit_c) %>% filter(term %in% VEL_VARS[5:6])
+  )
+  
+  results <- bind_rows(res_list) %>%
+    mutate(
+      Sex = sex_label,
+      # TR_1SD (Time Ratio (TR) n): relative change in puberty age for a +1 Standard Deviation increase in velocity
+      SD_val = as.numeric(sds[term]),
+      TR_1SD = exp(estimate * SD_val),
+      CI_low = exp((estimate - 1.96 * std.error) * SD_val),
+      CI_high = exp((estimate + 1.96 * std.error) * SD_val),
+      P_value = p.value,
+      Sig = case_when(
+        P_value < 0.001 ~ "***",
+        P_value < 0.01 ~ "**",
+        P_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(Sex, Exposure = term, Beta = estimate, TR_1SD, CI_low, CI_high, P_value, Sig)
+  
+  return(results)
+}
+
+## Save the SNAFT result-----------------------------
+
+results_boys  <- run_snaft(df_pooled, "Boys")
+results_girls <- run_snaft(df_pooled, "Girls")
+
+snaft_final_results <- bind_rows(results_boys, results_girls)
+
+output_file_path <- file.path(OUTPUT_DIR, "4_snaft_results.csv")
+write_csv(snaft_final_results, output_file_path)  ## Accelerating impact of late infancy growth (wt & ht) only in girls
+
+# =============================================================================
+# Table S1. Save a summary table for covariates' effect 
+# =============================================================================
+
+# 1. Create a function to extract covariate effects from Step 1 of SNAFT
+get_covariate_effects <- function(data, sex_label) {
+  # Subset and clean data
+  sub_df <- data %>% 
+    filter(boy == ifelse(sex_label == "Boys", 1, 0)) %>% 
+    drop_na(time, event, all_of(VEL_VARS), all_of(BASE_COVARIATES))
+  
+  # Step 1 Model (Full model including all exposures and covariates)
+  formula_full <- as.formula(paste("Surv(time, event) ~", 
+                                   paste(c(VEL_VARS, BASE_COVARIATES), collapse = " + ")))
+  fit_full <- survreg(formula_full, data = sub_df, dist = "lognormal")
+  
+  # Extract results using broom::tidy
+  model_results <- tidy(fit_full, conf.int = TRUE) %>%
+    filter(term %in% BASE_COVARIATES) %>% # Keep only the baseline covariates
+    mutate(
+      Sex = sex_label,
+      # In AFT, exp(Beta) is the Time Ratio
+      TR = exp(estimate),
+      TR_CI_low = exp(conf.low),
+      TR_CI_high = exp(conf.high),
+      P_value = p.value,
+      Sig = case_when(
+        P_value < 0.001 ~ "***",
+        P_value < 0.01 ~ "**",
+        P_value < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      Interpretation = ifelse(TR < 1, "Earlier Puberty", "Later Puberty")
+    ) %>%
+    select(Sex, Covariate = term, Beta = estimate, SE = std.error, 
+           TR, TR_CI_low, TR_CI_high, P_value, Sig, Interpretation)
+  
+  return(model_results)
+}
+
+cov_effects_boys  <- get_covariate_effects(df_pooled, "Boys")
+cov_effects_girls <- get_covariate_effects(df_pooled, "Girls")
+final_cov_table   <- bind_rows(cov_effects_boys, cov_effects_girls)
+
+cov_output_path <- file.path(OUTPUT_DIR, "4c_covariate_fixed_effects.csv")
+write_csv(final_cov_table, cov_output_path)
+
+# =============================================================================
+# Table 3. G-estimation of SNAFT model - STRATIFIED BY b3_rural
+# =============================================================================
+
+# --- Update Covariates ---
+# Removed 'b3_rural' from covariates, added 'boy' (sex) to adjust for it
+BASE_COVARIATES <- c("ga", "m_age", "birth_wt", "birth_ht", "ponderal_index", "m_diff_wt",
+                     "cs", "first_order", "m_univ", "f_univ", "m_employed", "f_employed",
+                     "m_smoking_preg", "f_smoking", "boy")
+
+VEL_VARS <- c("vel_wt_early_inf", "vel_ht_early_inf", "vel_wt_late_inf", 
+              "vel_ht_late_inf", "vel_wt_early_ch", "vel_ht_early_ch")
+
+run_snaft_rural <- function(data, rural_val, rural_label) {
+  # Subset by rural status
+  sub_df <- data %>% 
+    filter(b3_rural == rural_val) %>% 
+    drop_na(time, event, all_of(VEL_VARS), all_of(BASE_COVARIATES))
+  
+  if(nrow(sub_df) < 50) return(NULL)
+  
+  # Calculate SDs for 1-SD Time Ratio interpretation
+  sds <- sub_df %>% summarise(across(all_of(VEL_VARS), sd))
+  
+  # --- Step 1: Period C (Early Childhood) ---
+  formula_c <- as.formula(paste("Surv(time, event) ~", 
+                                paste(c(VEL_VARS, BASE_COVARIATES), collapse = " + ")))
+  fit_c <- survreg(formula_c, data = sub_df, dist = "lognormal")
+  
+  psi_c_wt <- coef(fit_c)["vel_wt_early_ch"]
+  psi_c_ht <- coef(fit_c)["vel_ht_early_ch"]
+  
+  # --- Step 2: Compute Counterfactual U_B ---
+  sub_df$U_B <- sub_df$time * exp(-(psi_c_wt * sub_df$vel_wt_early_ch + 
+                                      psi_c_ht * sub_df$vel_ht_early_ch))
+  
+  # --- Step 3: Period B (Late Infancy) ---
+  formula_b <- as.formula(paste("Surv(U_B, event) ~", 
+                                paste(c(VEL_VARS[1:4], BASE_COVARIATES), collapse = " + ")))
+  fit_b <- survreg(formula_b, data = sub_df, dist = "lognormal")
+  
+  psi_b_wt <- coef(fit_b)["vel_wt_late_inf"]
+  psi_b_ht <- coef(fit_b)["vel_ht_late_inf"]
+  
+  # --- Step 4: Compute Counterfactual U_A ---
+  sub_df$U_A <- sub_df$U_B * exp(-(psi_b_wt * sub_df$vel_wt_late_inf + 
+                                     psi_b_ht * sub_df$vel_ht_late_inf))
+  
+  # --- Step 5: Period A (Early Infancy) ---
+  formula_a <- as.formula(paste("Surv(U_A, event) ~", 
+                                paste(c(VEL_VARS[1:2], BASE_COVARIATES), collapse = " + ")))
+  fit_a <- survreg(formula_a, data = sub_df, dist = "lognormal")
+  
+  # --- Collect and Format Results ---
+  res_list <- list(
+    tidy(fit_a) %>% filter(term %in% VEL_VARS[1:2]),
+    tidy(fit_b) %>% filter(term %in% VEL_VARS[3:4]),
+    tidy(fit_c) %>% filter(term %in% VEL_VARS[5:6])
+  )
+  
+  results <- bind_rows(res_list) %>%
+    mutate(
+      Region = rural_label,
+      SD_val = as.numeric(sds[term]),
+      TR_1SD = exp(estimate * SD_val),
+      CI_low = exp((estimate - 1.96 * std.error) * SD_val),
+      CI_high = exp((estimate + 1.96 * std.error) * SD_val),
+      P_value = p.value,
+      Sig = case_when(
+        P_value < 0.001 ~ "***",
+        P_value < 0.01 ~ "**",
+        P_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(Region, Exposure = term, Beta = estimate, TR_1SD, CI_low, CI_high, P_value, Sig)
+  
+  return(results)
+}
+
+## Run and Save the SNAFT result -----------------------------
+# Assumes 0 = Urban, 1 = Rural (adjust values and labels if your data uses different codes)
+results_urban <- run_snaft_rural(df, rural_val = 0, rural_label = "Urban")
+results_rural <- run_snaft_rural(df, rural_val = 1, rural_label = "Rural")
+
+snaft_final_results_rural <- bind_rows(results_urban, results_rural)
+
+output_file_path <- file.path(OUTPUT_DIR, "4_snaft_results_by_rural.csv")
+write_csv(snaft_final_results_rural, output_file_path)
+
+# =============================================================================
+# Save a summary table for covariates' effect (Stratified by Rural)
+# =============================================================================
+
+get_covariate_effects_rural <- function(data, rural_val, rural_label) {
+  # Subset and clean data
+  sub_df <- data %>% 
+    filter(b3_rural == rural_val) %>% 
+    drop_na(time, event, all_of(VEL_VARS), all_of(BASE_COVARIATES))
+  
+  # Step 1 Model
+  formula_full <- as.formula(paste("Surv(time, event) ~", 
+                                   paste(c(VEL_VARS, BASE_COVARIATES), collapse = " + ")))
+  fit_full <- survreg(formula_full, data = sub_df, dist = "lognormal")
+  
+  model_results <- tidy(fit_full, conf.int = TRUE) %>%
+    filter(term %in% BASE_COVARIATES) %>%
+    mutate(
+      Region = rural_label,
+      TR = exp(estimate),
+      TR_CI_low = exp(conf.low),
+      TR_CI_high = exp(conf.high),
+      P_value = p.value,
+      Sig = case_when(
+        P_value < 0.001 ~ "***",
+        P_value < 0.01 ~ "**",
+        P_value < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      Interpretation = ifelse(TR < 1, "Earlier Puberty", "Later Puberty")
+    ) %>%
+    select(Region, Covariate = term, Beta = estimate, SE = std.error, 
+           TR, TR_CI_low, TR_CI_high, P_value, Sig, Interpretation)
+  
+  return(model_results)
+}
+
+cov_urban <- get_covariate_effects_rural(df_pooled, 0, "Urban")
+cov_rural <- get_covariate_effects_rural(df_pooled, 1, "Rural")
+final_cov_table_rural <- bind_rows(cov_urban, cov_rural)
+
+cov_output_path <- file.path(OUTPUT_DIR, "4c_covariate_fixed_effects_by_rural.csv")
+write_csv(final_cov_table_rural, cov_output_path)
