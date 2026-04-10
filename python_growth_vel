@@ -1,0 +1,958 @@
+"""
+=============================================================================
+Puberty Timing & Growth Analysis: Combined MOCHE-PSKC Dataset
+=============================================================================
+Analyses:
+  1. Descriptive table (frequencies, mean/median, missing rates)
+     -- per MOCHE, per PSKC, and combined
+  2. Complete-case dataset (no imputation)
+     + descriptive table on complete cases
+  3. Pairwise association between continuous variables
+  4. Parametric g-computation for sequential growth → puberty-age pathway
+     Stratified by sex (boys / girls)
+=============================================================================
+"""
+# pip install scipy matplotlib seaborn statsmodels (run in terminal if needed)
+
+import os
+import sys
+import warnings
+import textwrap
+
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import matplotlib
+matplotlib.use("Agg")          # non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+warnings.filterwarnings("ignore")
+
+# ─── USER SETTINGS ────────────────────────────────────────────────────────────
+DATA_PATH = r"...\Final datasets\combined_MOCHE_PSKC.pkl"
+OUTPUT_DIR = r"...\Outputs"          # change to your preferred output folder
+RANDOM_SEED   = 42
+# ──────────────────────────────────────────────────────────────────────────────
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.  Load data & derive variables
+# ══════════════════════════════════════════════════════════════════════════════
+
+df_raw = pd.read_pickle(DATA_PATH)
+df = df_raw.copy()
+
+# --- Derived variables -------------------------------------------------------
+
+# Ponderal index = birth weight (kg) / (birth height (m))^3
+df["ponderal_index"] = df["birth_wt"] / ((df["birth_ht"] / 100) ** 3)
+
+# Maternal gestational weight gain
+df["m_diff_wt"] = df["m_pre2_wt"] - df["m_pre1_wt"]
+
+# Puberty age: G_age for boys, M_age for girls
+df["puberty_age"] = np.where(
+    df["boy"] == 1, df["G_age"],
+    np.where(df["boy"] == 0, df["M_age"], np.nan)
+)
+
+# Growth velocity variables  (weight in kg, height in cm)
+# Early infancy : birth → ~6 months
+df["vel_wt_early_inf"]  = df["b_wt"]  - df["birth_wt"]
+df["vel_ht_early_inf"]  = df["b_ht"]  - df["birth_ht"]
+# Late infancy  : 6 m → 24 months
+df["vel_wt_late_inf"]   = df["b2_wt"] - df["b_wt"]
+df["vel_ht_late_inf"]   = df["b2_ht"] - df["b_ht"]
+# Early childhood : 24 m → 60 months
+df["vel_wt_early_ch"]   = df["b5_wt"] - df["b2_wt"]
+df["vel_ht_early_ch"]   = df["b5_ht"] - df["b2_ht"]
+
+# Cohort label
+df["cohort"] = np.where(df["MOCHE"] == 1, "MOCHE", "PSKC")
+
+print(f"  Total N = {len(df):,}  (MOCHE={df['MOCHE'].sum():,}  PSKC={df['PSKC'].sum():,})")
+print(f"  Boys = {int(df['boy'].eq(1).sum()):,}  Girls = {int(df['boy'].eq(0).sum()):,}")
+print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  DESCRIPTIVE TABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("=" * 70)
+print("SECTION 1 – DESCRIPTIVE STATISTICS")
+print("=" * 70)
+
+# ------ variable catalogues --------------------------------------------------
+
+# Continuous variables
+CONT_VARS = [
+    ("ga",              "Gestational age (weeks)"),
+    ("m_age",           "Maternal age (years)"),
+    ("m_ht",            "Maternal height (cm)"),
+    ("m_pre1_wt",       "Maternal pre-preg weight (kg)"),
+    ("m_pre2_wt",       "Maternal delivery weight (kg)"),
+    ("m_diff_wt",       "Maternal gestational weight gain (kg)"),
+    ("birth_wt",        "Birth weight (kg)"),
+    ("birth_ht",        "Birth height (cm)"),
+    ("ponderal_index",  "Ponderal index (kg/m³)"),
+    ("b_wt",            "Weight at ~6 m (kg)"),
+    ("b_ht",            "Height at ~6 m (cm)"),
+    ("b1_wt",           "Weight at 12 m (kg)"),
+    ("b1_ht",           "Height at 12 m (cm)"),
+    ("b2_wt",           "Weight at 24 m (kg)"),
+    ("b2_ht",           "Height at 24 m (cm)"),
+    ("b3_wt",           "Weight at 36 m (kg)"),
+    ("b3_ht",           "Height at 36 m (cm)"),
+    ("b4_wt",           "Weight at 48 m (kg)"),
+    ("b4_ht",           "Height at 48 m (cm)"),
+    ("b5_wt",           "Weight at 60 m (kg)"),
+    ("b5_ht",           "Height at 60 m (cm)"),
+    ("b6_wt",           "Weight at 72 m (kg)"),
+    ("b6_ht",           "Height at 72 m (cm)"),
+    ("b7_wt",           "Weight at 84 m (kg)"),
+    ("b7_ht",           "Height at 84 m (cm)"),
+    ("b8_wt",           "Weight at 96 m (kg)"),
+    ("b8_ht",           "Height at 96 m (cm)"),
+    ("vel_wt_early_inf","Weight velocity: early infancy (kg)"),
+    ("vel_ht_early_inf","Height velocity: early infancy (cm)"),
+    ("vel_wt_late_inf", "Weight velocity: late infancy (kg)"),
+    ("vel_ht_late_inf", "Height velocity: late infancy (cm)"),
+    ("vel_wt_early_ch", "Weight velocity: early childhood (kg)"),
+    ("vel_ht_early_ch", "Height velocity: early childhood (cm)"),
+    ("G_age",           "Genital dev. age – boys (years)"),
+    ("M_age",           "Menarche age – girls (years)"),
+    ("puberty_age",     "Puberty age (years)"),
+]
+
+# Binary / categorical variables
+CAT_VARS = [
+    ("boy",             "Male sex"),
+    ("cs",              "Caesarean section"),
+    ("first_order",     "First-born"),
+    ("m_univ",          "Mother – university education"),
+    ("f_univ",          "Father – university education"),
+    ("m_employed",      "Mother employed"),
+    ("f_employed",      "Father employed"),
+    ("m_smoking_preg",  "Maternal smoking in pregnancy"),
+    ("f_smoking",       "Paternal smoking"),
+    ("G",               "Genital dev. observed (boys)"),
+    ("M",               "Menarche observed (girls)"),
+    ("c_milk_ty",       "Milk type at 6 m"),
+    ("c_dis1",          "Diarrhoea at 6 m"),
+    ("c2_ato",          "Atopic dermatitis at 24 m"),
+]
+
+
+def describe_one(data: pd.DataFrame, varname: str, vtype: str) -> dict:
+    """Return a dict of summary stats for one variable in 'data'."""
+    col = data[varname]
+    n_total   = len(col)
+    n_missing = col.isna().sum()
+    n_valid   = n_total - n_missing
+    pct_miss  = 100.0 * n_missing / n_total if n_total > 0 else np.nan
+
+    if vtype == "cont":
+        return {
+            "N_total":    n_total,
+            "N_valid":    n_valid,
+            "N_missing":  n_missing,
+            "Pct_missing": round(pct_miss, 1),
+            "Mean":       round(col.mean(), 3),
+            "SD":         round(col.std(),  3),
+            "Median":     round(col.median(), 3),
+            "Q1":         round(col.quantile(0.25), 3),
+            "Q3":         round(col.quantile(0.75), 3),
+            "Min":        round(col.min(), 3),
+            "Max":        round(col.max(), 3),
+        }
+    else:          # categorical
+        vc = col.value_counts(dropna=True)
+        freq_str = "; ".join(
+            [f"{k}: {v} ({100*v/n_valid:.1f}%)"
+             for k, v in vc.items()]
+        ) if n_valid > 0 else "—"
+        return {
+            "N_total":    n_total,
+            "N_valid":    n_valid,
+            "N_missing":  n_missing,
+            "Pct_missing": round(pct_miss, 1),
+            "Frequencies": freq_str,
+        }
+
+
+def build_desc_table(data: pd.DataFrame,
+                     cont_vars, cat_vars,
+                     label: str = "") -> pd.DataFrame:
+    """Build a single descriptive table for *data*."""
+    rows = []
+    for vname, vlabel in cont_vars:
+        if vname not in data.columns:
+            continue
+        d = describe_one(data, vname, "cont")
+        rows.append({
+            "Variable":   vname,
+            "Label":      vlabel,
+            "Type":       "Continuous",
+            **d,
+        })
+    for vname, vlabel in cat_vars:
+        if vname not in data.columns:
+            continue
+        d = describe_one(data, vname, "cat")
+        rows.append({
+            "Variable":   vname,
+            "Label":      vlabel,
+            "Type":       "Categorical",
+            **d,
+        })
+    tbl = pd.DataFrame(rows)
+    tbl.insert(0, "Cohort", label)
+    return tbl
+
+
+# Build per-cohort + combined tables
+tbl_moche    = build_desc_table(df[df["MOCHE"] == 1], CONT_VARS, CAT_VARS, "MOCHE")
+tbl_pskc     = build_desc_table(df[df["PSKC"]  == 1], CONT_VARS, CAT_VARS, "PSKC")
+tbl_combined = build_desc_table(df,                   CONT_VARS, CAT_VARS, "Combined")
+
+desc_all = pd.concat([tbl_moche, tbl_pskc, tbl_combined], ignore_index=True)
+out_desc = os.path.join(OUTPUT_DIR, "1_descriptive_table_com_case.csv")
+desc_all.to_csv(out_desc, index=False, encoding="utf-8-sig")
+print(f"  ✓ Descriptive table saved → {out_desc}")
+print()
+
+# Create codebook
+codebook_rows = []
+for vname, vlabel in CONT_VARS:
+    if vname not in df.columns:
+        continue
+    col = df[vname]
+    n_missing = col.isna().sum()
+    n_valid = len(col) - n_missing
+    if n_valid > 0:
+        min_val = round(col.min(), 3)
+        max_val = round(col.max(), 3)
+        mean_val = round(col.mean(), 3)
+        sd_val = round(col.std(), 3)
+        range_str = f"{min_val} to {max_val}"
+    else:
+        range_str = "N/A"
+        mean_val = "N/A"
+        sd_val = "N/A"
+    codebook_rows.append({
+        "Variable": vname,
+        "Label": vlabel,
+        "Type": "Continuous",
+        "Range": range_str,
+        "Mean": mean_val,
+        "SD": sd_val,
+        "N_Missing": n_missing,
+    })
+
+for vname, vlabel in CAT_VARS:
+    if vname not in df.columns:
+        continue
+    col = df[vname]
+    n_missing = col.isna().sum()
+    n_valid = len(col) - n_missing
+    if n_valid > 0:
+        vc = col.value_counts(dropna=True)
+        freq_str = "; ".join([f"{k}: {v} ({100*v/n_valid:.1f}%)" for k, v in vc.items()])
+    else:
+        freq_str = "N/A"
+    codebook_rows.append({
+        "Variable": vname,
+        "Label": vlabel,
+        "Type": "Categorical",
+        "Range": freq_str,
+        "Mean": "N/A",
+        "SD": "N/A",
+        "N_Missing": n_missing,
+    })
+
+codebook_df = pd.DataFrame(codebook_rows)
+out_codebook = os.path.join(OUTPUT_DIR, "codebook_com_case.csv")
+codebook_df.to_csv(out_codebook, index=False, encoding="utf-8-sig")
+print(f"  ✓ Codebook saved → {out_codebook}")
+print()
+
+
+# ── Time-to-puberty variables (survival outcome) ──────────────────────────────
+# event = 1 if puberty observed (G=1 for boys, M=1 for girls), 0 if censored.
+# time  = puberty_age        when event = 1
+#       = age at last available weight measurement  when event = 0  (censoring)
+#       = NaN                when puberty status is unknown
+#
+# Weight measurement ages (years):
+#   b_wt = 0.5 yr (6 m), b1_wt = 1 yr, b2_wt = 2 yr, …, b8_wt = 8 yr
+# The last non-missing weight defines the censoring time for event = 0 rows.
+
+_WT_TIMELINE = [
+    ("b_wt",  0.5),
+    ("b1_wt", 1.0),
+    ("b2_wt", 2.0),
+    ("b3_wt", 3.0),
+    ("b4_wt", 4.0),
+    ("b5_wt", 5.0),
+    ("b6_wt", 6.0),
+    ("b7_wt", 7.0),
+    ("b8_wt", 8.0),
+]
+
+# Vectorised: scan columns in order; keep updating with later ages
+_last_wt_age = np.full(len(df), np.nan)
+for _col, _age in _WT_TIMELINE:
+    if _col in df.columns:
+        _last_wt_age = np.where(df[_col].notna(), _age, _last_wt_age)
+df["_last_wt_age"] = _last_wt_age
+
+# Event indicator: 1 if any puberty response observed (G=1, M=1, or puberty_age present);
+#                  0 if at least one of G/M is recorded but none positive;
+#                  NaN if G, M, and puberty_age are all missing.
+_any_event = df["G"].eq(1) | df["M"].eq(1) | df["puberty_age"].notna()
+_any_known = df["G"].notna() | df["M"].notna() | df["puberty_age"].notna()
+df["event"] = np.where(_any_event, 1, np.where(_any_known, 0, np.nan))
+
+# Time variable
+df["time"] = np.where(
+    df["event"].isna(),   np.nan,              # unknown puberty status
+    np.where(
+        df["event"] == 1, df["puberty_age"],   # observed puberty
+        df["_last_wt_age"]                     # censored at last weight visit
+    )
+)
+
+_n_ev  = int(df["event"].eq(1).sum())
+_n_cen = int(df["event"].eq(0).sum())
+_n_mis = int(df["event"].isna().sum())
+print(f"  Time-to-puberty:  events={_n_ev},  censored={_n_cen},  missing={_n_mis}")
+print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  COMPLETE-CASE DATASET
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("=" * 70)
+print("SECTION 2 – COMPLETE-CASE DATASET")
+print("=" * 70)
+
+# Variables that must be non-missing for inclusion in analyses
+CC_VARS = [
+    "ga", "m_age",
+    "birth_wt", "birth_ht",
+    "b_wt",  "b_ht",
+    "b2_wt", "b2_ht",
+    "b5_wt", "b5_ht",
+    "boy", "cs", "first_order",
+    "m_univ", "f_univ", "m_employed", "f_employed",
+    "m_smoking_preg", "f_smoking",
+    "MOCHE",
+    "event", "time",
+]
+CC_VARS = [c for c in CC_VARS if c in df.columns]
+
+df_pooled = df.dropna(subset=CC_VARS).copy()
+
+n_full = len(df)
+n_cc   = len(df_pooled)
+print(f"  Full dataset:      N = {n_full:,}")
+print(f"  Complete cases:    N = {n_cc:,}  ({100*n_cc/n_full:.1f}% retained)")
+print()
+
+tbl_cc = build_desc_table(df_pooled, CONT_VARS, CAT_VARS, "Complete-cases")
+out_cc_desc = os.path.join(OUTPUT_DIR, "2_descriptive_complete_cases_com_case.csv")
+tbl_cc.to_csv(out_cc_desc, index=False, encoding="utf-8-sig")
+print(f"  ✓ Complete-case descriptive table saved → {out_cc_desc}")
+print()
+
+# Save complete-case dataset
+final_dataset_path = os.path.join(os.path.dirname(DATA_PATH), "complete_case_dataset_com_case.csv")
+df_pooled.to_csv(final_dataset_path, index=False, encoding="utf-8-sig")
+print(f"  ✓ Complete-case dataset saved → {final_dataset_path}")
+print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  PAIRWISE ASSOCIATIONS – CONTINUOUS VARIABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("=" * 70)
+print("SECTION 3 – PAIRWISE ASSOCIATIONS")
+print("=" * 70)
+
+PAIRWISE_VARS = [
+    "ga", "m_age", "birth_wt", "birth_ht", "ponderal_index", "m_diff_wt",
+    "b_wt",  "b_ht",
+    "b1_wt", "b1_ht",
+    "b2_wt", "b2_ht",
+    "b3_wt", "b3_ht",
+    "b4_wt", "b4_ht",
+    "b5_wt", "b5_ht",
+    "puberty_age",
+]
+PAIRWISE_VARS = [v for v in PAIRWISE_VARS if v in df_pooled.columns]
+
+def pairwise_table(data, varlist, label):
+    """Compute Pearson r (+ p-value) for all pairs; return long-format df."""
+    rows = []
+    for i, v1 in enumerate(varlist):
+        for j, v2 in enumerate(varlist):
+            if j <= i:
+                continue
+            sub = data[[v1, v2]].dropna()
+            if len(sub) < 10:
+                continue
+            r, p = stats.pearsonr(sub[v1], sub[v2])
+            rows.append({
+                "Group":    label,
+                "Var1":     v1,
+                "Var2":     v2,
+                "N":        len(sub),
+                "Pearson_r": round(r, 4),
+                "P_value":  f"{p:.4e}",
+                "Sig":      "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else "")),
+            })
+    return pd.DataFrame(rows)
+
+# Overall + stratified by sex
+pairs_all   = pairwise_table(df_pooled,                    PAIRWISE_VARS, "All")
+pairs_boys  = pairwise_table(df_pooled[df_pooled["boy"]==1], PAIRWISE_VARS, "Boys")
+pairs_girls = pairwise_table(df_pooled[df_pooled["boy"]==0], PAIRWISE_VARS, "Girls")
+
+pairs_combined = pd.concat([pairs_all, pairs_boys, pairs_girls], ignore_index=True)
+out_pairs = os.path.join(OUTPUT_DIR, "3_pairwise_associations_com_case.csv")
+pairs_combined.to_csv(out_pairs, index=False, encoding="utf-8-sig")
+print(f"  ✓ Pairwise association table saved → {out_pairs}")
+
+# ---- Correlation heat-maps (pooled data, full sample) -----------------------
+def plot_corrmap(data, varlist, title, outfile):
+    corr = data[varlist].corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    fig, ax = plt.subplots(figsize=(14, 12))
+    sns.heatmap(
+        corr, mask=mask, annot=True, fmt=".2f", cmap="RdBu_r",
+        center=0, vmin=-1, vmax=1,
+        linewidths=0.4, ax=ax, annot_kws={"size": 7},
+        xticklabels=varlist, yticklabels=varlist,
+    )
+    ax.set_title(title, fontsize=13, pad=12)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=150)
+    plt.close()
+
+plot_corrmap(
+    df_pooled, PAIRWISE_VARS,
+    "Pairwise Correlation – All",
+    os.path.join(OUTPUT_DIR, "3a_corrmap_all.png"),
+)
+plot_corrmap(
+    df_pooled[df_pooled["boy"]==1], PAIRWISE_VARS,
+    "Pairwise Correlation – Boys",
+    os.path.join(OUTPUT_DIR, "3b_corrmap_boys.png"),
+)
+plot_corrmap(
+    df_pooled[df_pooled["boy"]==0], PAIRWISE_VARS,
+    "Pairwise Correlation – Girls",
+    os.path.join(OUTPUT_DIR, "3c_corrmap_girls.png"),
+)
+print("  ✓ Correlation heat-maps saved (3a/3b/3c)")
+print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  STRUCTURAL NESTED ACCELERATED FAILURE TIME (SNAFT) MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Causal chain of growth-velocity periods:
+#   A (early infancy, birth→6 m) → B (late infancy, 6→24 m)
+#                                 → C (early childhood, 24→60 m)
+#                                 → time-to-puberty
+#
+# Framework: Sequential G-estimation for structural nested log-linear AFT.
+#
+#   Structural model (log-linear):
+#     log T_i(0) = log T_i − ψ_C·vel_C_i − ψ_B·vel_B_i − ψ_A·vel_A_i
+#   where T_i(0) is the counterfactual puberty time under zero velocity.
+#
+#   Estimation proceeds backwards (C → B → A):
+#     Step 1. Fit log-normal AFT for log(time) with all velocities + L.
+#             ψ_C = AFT coefficient of vel_C  (conditional on vel_A, vel_B).
+#     Step 2. Compute counterfactual U_B = time · exp(−ψ_C · vel_C).
+#             For censored individuals, U_B is still right-censored at
+#             C_i · exp(−ψ_C · vel_C_i); the event indicator is unchanged.
+#     Step 3. Fit log-normal AFT for log(U_B) with vel_B, vel_A + L.
+#             ψ_B = AFT coefficient of vel_B.
+#     Step 4. Compute U_A = U_B · exp(−ψ_B · vel_B) and fit AFT for
+#             log(U_A) with vel_A + L.  ψ_A = AFT coefficient of vel_A.
+#
+#   Mediator models (OLS, no censoring):
+#     vel_B ~ vel_A + L
+#     vel_C ~ vel_A + vel_B + L
+#   used only in the Monte-Carlo scenario step to propagate interventions
+#   through the causal chain.
+#
+# Censoring: participants without observed puberty are right-censored at
+#   their age at the last available weight measurement (variable "time",
+#   event=0).  There are no competing risks (death is negligible here).
+#
+# Results reported per exposure:
+#   ψ       – log-time ratio per 1-unit increase in velocity
+#   TR_1SD  = exp(ψ · SD_vel) – time ratio for a +1-SD shift
+#   95 % CI via Rubin's rules across imputed datasets.
+# ──────────────────────────────────────────────────────────────────────────────
+
+from scipy.optimize import minimize as _minimize
+
+print("=" * 70)
+print("SECTION 4 – STRUCTURAL NESTED AFT (SNAFT) MODELS")
+print("=" * 70)
+
+BASE_COVARIATES = [
+    "ga", "m_age", "birth_wt", "birth_ht", "ponderal_index", "m_diff_wt",
+    "cs", "first_order", "m_univ", "f_univ", "m_employed", "f_employed",
+    "m_smoking_preg", "f_smoking", "b3_rural", "b4_rural", "MOCHE",
+]
+BASE_COVARIATES = [c for c in BASE_COVARIATES if c in df_pooled.columns]
+
+EXP_A_WT = "vel_wt_early_inf"
+EXP_A_HT = "vel_ht_early_inf"
+EXP_B_WT = "vel_wt_late_inf"
+EXP_B_HT = "vel_ht_late_inf"
+EXP_C_WT = "vel_wt_early_ch"
+EXP_C_HT = "vel_ht_early_ch"
+
+ALL_EXPS = [EXP_A_WT, EXP_A_HT, EXP_B_WT, EXP_B_HT, EXP_C_WT, EXP_C_HT]
+
+
+# ── Parametric log-normal AFT via MLE ─────────────────────────────────────────
+def fit_lognormal_aft(log_time, event, X):
+    """
+    Log-normal AFT model fitted by maximum likelihood.
+
+    Parameters
+    ----------
+    log_time : array (n,)  – log of observed time (event or censoring)
+    event    : array (n,)  – 1 = event, 0 = right-censored
+    X        : array (n,p) – design matrix (include intercept column)
+
+    Returns
+    -------
+    beta_hat  : array (p,)  – AFT coefficients (log-time scale)
+    sigma_hat : float       – estimated scale parameter
+    var_beta  : array (p,)  – approximate variances of beta_hat
+    """
+    n, p = X.shape
+    ev = event.astype(bool)
+
+    def neg_ll(params):
+        beta  = params[:p]
+        sigma = np.exp(params[p])          # log-parameterised → unconstrained
+        mu    = X @ beta
+        z     = (log_time - mu) / sigma
+        ll    = np.where(ev,
+                         stats.norm.logpdf(z) - np.log(sigma),
+                         stats.norm.logsf(z))
+        return -np.nansum(ll)
+
+    # Initialise from OLS on events only
+    if ev.sum() > p:
+        beta0 = np.linalg.lstsq(X[ev], log_time[ev], rcond=None)[0]
+        sig0  = max(np.std(log_time[ev] - X[ev] @ beta0), 0.05)
+    else:
+        beta0, sig0 = np.zeros(p), 1.0
+
+    x0  = np.append(beta0, np.log(sig0))
+    res = _minimize(neg_ll, x0, method="BFGS",
+                    options={"maxiter": 3000, "gtol": 1e-6})
+
+    beta_hat  = res.x[:p]
+    sigma_hat = np.exp(res.x[p])
+
+    # Variance from BFGS inverse-Hessian approximation
+    try:
+        var_all  = np.diag(np.array(res.hess_inv))
+        var_beta = var_all[:p]
+    except Exception:
+        var_beta = np.full(p, np.nan)
+
+    return beta_hat, sigma_hat, var_beta
+
+
+# ── Helper: OLS fit (for mediator models) ────────────────────────────────────
+def _fit_ols(formula, data):
+    try:
+        vars_needed = [s.strip() for s in formula.replace("~", "+").split("+")]
+        return smf.ols(formula, data=data.dropna(subset=vars_needed)).fit()
+    except Exception:
+        return None
+
+
+# ── Main SNAFT function ───────────────────────────────────────────────────────
+def run_snaft_sex(sex_label, imp_datasets_list):
+    """
+    Sequential SNAFT g-estimation for one sex stratum.
+
+    For each imputed dataset:
+      1. Merges outcome variables (event, time) from original df.
+      2. Fits log-normal AFT models backwards (C → B → A) to estimate ψ.
+      3. Runs Monte-Carlo scenario simulation (+1 / −1 SD per velocity),
+         propagating interventions through mediator-model predictions.
+      4. Reports pooled Time Ratios (TR = exp(ψ·SD)) via Rubin's rules.
+    """
+    sex_val = 1 if sex_label == "Boys" else 0
+
+    # Outcome variable names (sex-specific)
+    age_col = "G_age" if sex_val == 1 else "M_age"
+
+    # Storage: {exposure: list of (psi_hat, var_psi, SD_exp)}
+    psi_store = {e: [] for e in ALL_EXPS}
+
+    # Storage for covariate fixed effects from full AFT model (Step 1)
+    # {covariate: list of (beta_hat, var_beta)}
+    cov_store = {}
+
+    # Scenario-level storage for Monte-Carlo TR (pooled across imputations)
+    scenarios = {
+        f"{e}_+1SD": (e, +1) for e in ALL_EXPS
+    }
+    scenarios.update({
+        f"{e}_-1SD": (e, -1) for e in ALL_EXPS
+    })
+    mc_store = {sc: [] for sc in scenarios}
+
+    for _, data_k in enumerate(imp_datasets_list):
+        dk = data_k.copy()
+
+        # ── Merge outcome variables from original (non-imputed) data ──────
+        for col in ["event", "time", "_last_wt_age", age_col]:
+            if col in df.columns:
+                dk[col] = df.loc[dk.index, col]
+
+        # Subset to sex; require both outcome and at least one velocity
+        dk = dk[dk["boy"] == sex_val].copy()
+        dk = dk.dropna(subset=["event", "time"])
+        if len(dk) < 30:
+            continue
+
+        # Recalculate velocities on this imputed dataset
+        dk[EXP_A_WT] = dk["b_wt"]  - dk["birth_wt"]
+        dk[EXP_A_HT] = dk["b_ht"]  - dk["birth_ht"]
+        dk[EXP_B_WT] = dk["b2_wt"] - dk["b_wt"]
+        dk[EXP_B_HT] = dk["b2_ht"] - dk["b_ht"]
+        dk[EXP_C_WT] = dk["b5_wt"] - dk["b2_wt"]
+        dk[EXP_C_HT] = dk["b5_ht"] - dk["b2_ht"]
+
+        exp_sds = {e: dk[e].std() for e in ALL_EXPS}
+
+        # Drop rows with non-positive time (log undefined)
+        dk = dk[dk["time"] > 0].copy()
+        log_time = np.log(dk["time"].values)
+        event_k  = dk["event"].values.astype(float)
+
+        cov_cols = [c for c in BASE_COVARIATES
+                    if c in dk.columns and dk[c].nunique() > 1]
+
+        def _design(data, cols):
+            """Build design matrix with intercept."""
+            X = data[cols].copy()
+            X.insert(0, "_intercept", 1.0)
+            return X.fillna(X.mean()).values
+
+        # ── Step 1: AFT for period C velocities ──────────────────────────
+        # Full model: log T ~ vel_C + vel_B + vel_A + covariates
+        full_cols = ALL_EXPS + cov_cols
+        full_cols = [c for c in full_cols if c in dk.columns]
+        X_full = _design(dk, full_cols)
+        try:
+            beta_full, _, var_full = fit_lognormal_aft(log_time, event_k, X_full)
+        except Exception:
+            continue
+
+        # Map column names to beta indices (0 = intercept)
+        col_idx = {c: i + 1 for i, c in enumerate(full_cols)}
+
+        def _psi_var(exp_name):
+            idx = col_idx.get(exp_name)
+            if idx is None:
+                return np.nan, np.nan
+            return beta_full[idx], var_full[idx]
+
+        psi_C_wt, var_C_wt = _psi_var(EXP_C_WT)
+        psi_C_ht, var_C_ht = _psi_var(EXP_C_HT)
+        psi_store[EXP_C_WT].append((psi_C_wt, var_C_wt, exp_sds[EXP_C_WT]))
+        psi_store[EXP_C_HT].append((psi_C_ht, var_C_ht, exp_sds[EXP_C_HT]))
+
+        # ── Extract covariate betas from full model ───────────────────────
+        for cov in cov_cols:
+            idx = col_idx.get(cov)
+            if idx is None:
+                continue
+            if cov not in cov_store:
+                cov_store[cov] = []
+            cov_store[cov].append((beta_full[idx], var_full[idx]))
+
+        # ── Step 2: Counterfactual U_B = time · exp(−ψ_C · vel_C) ───────
+        U_B = dk["time"].values * np.exp(
+            -psi_C_wt * dk[EXP_C_WT].values
+            -psi_C_ht * dk[EXP_C_HT].values
+        )
+        U_B = np.clip(U_B, 1e-6, None)
+        log_U_B = np.log(U_B)
+
+        # ── Step 3: AFT for period B velocities on U_B ───────────────────
+        B_cols = [EXP_B_WT, EXP_B_HT, EXP_A_WT, EXP_A_HT] + cov_cols
+        B_cols = [c for c in B_cols if c in dk.columns]
+        X_B = _design(dk, B_cols)
+        try:
+            beta_B, _, var_B = fit_lognormal_aft(log_U_B, event_k, X_B)
+        except Exception:
+            continue
+
+        col_idx_B = {c: i + 1 for i, c in enumerate(B_cols)}
+        def _psi_var_B(exp_name):
+            idx = col_idx_B.get(exp_name)
+            if idx is None:
+                return np.nan, np.nan
+            return beta_B[idx], var_B[idx]
+
+        psi_B_wt, var_B_wt = _psi_var_B(EXP_B_WT)
+        psi_B_ht, var_B_ht = _psi_var_B(EXP_B_HT)
+        psi_store[EXP_B_WT].append((psi_B_wt, var_B_wt, exp_sds[EXP_B_WT]))
+        psi_store[EXP_B_HT].append((psi_B_ht, var_B_ht, exp_sds[EXP_B_HT]))
+
+        # ── Step 4: Counterfactual U_A = U_B · exp(−ψ_B · vel_B) ────────
+        U_A = U_B * np.exp(
+            -psi_B_wt * dk[EXP_B_WT].values
+            -psi_B_ht * dk[EXP_B_HT].values
+        )
+        U_A = np.clip(U_A, 1e-6, None)
+        log_U_A = np.log(U_A)
+
+        # ── Step 5: AFT for period A velocities on U_A ───────────────────
+        A_cols = [EXP_A_WT, EXP_A_HT] + cov_cols
+        A_cols = [c for c in A_cols if c in dk.columns]
+        X_A = _design(dk, A_cols)
+        try:
+            beta_A, _, var_A = fit_lognormal_aft(log_U_A, event_k, X_A)
+        except Exception:
+            continue
+
+        col_idx_A = {c: i + 1 for i, c in enumerate(A_cols)}
+        def _psi_var_A(exp_name):
+            idx = col_idx_A.get(exp_name)
+            if idx is None:
+                return np.nan, np.nan
+            return beta_A[idx], var_A[idx]
+
+        psi_A_wt, var_A_wt = _psi_var_A(EXP_A_WT)
+        psi_A_ht, var_A_ht = _psi_var_A(EXP_A_HT)
+        psi_store[EXP_A_WT].append((psi_A_wt, var_A_wt, exp_sds[EXP_A_WT]))
+        psi_store[EXP_A_HT].append((psi_A_ht, var_A_ht, exp_sds[EXP_A_HT]))
+
+        # ── Mediator models (OLS) for Monte-Carlo scenario propagation ────
+        cov_str = " + ".join(cov_cols) if cov_cols else ""
+        def _cov(suffix=""):
+            return (f" + {cov_str}" if cov_str else "")
+
+        m_bwt = _fit_ols(f"{EXP_B_WT} ~ {EXP_A_WT} + {EXP_A_HT}" + _cov(), dk)
+        m_bht = _fit_ols(f"{EXP_B_HT} ~ {EXP_A_WT} + {EXP_A_HT}" + _cov(), dk)
+        m_cwt = _fit_ols(
+            f"{EXP_C_WT} ~ {EXP_A_WT} + {EXP_A_HT} + {EXP_B_WT} + {EXP_B_HT}" + _cov(), dk)
+        m_cht = _fit_ols(
+            f"{EXP_C_HT} ~ {EXP_A_WT} + {EXP_A_HT} + {EXP_B_WT} + {EXP_B_HT}" + _cov(), dk)
+
+        if any(m is None for m in [m_bwt, m_bht, m_cwt, m_cht]):
+            continue
+
+        # Collect per-scenario log-TR using current imputation's ψ estimates
+        psi_map = {
+            EXP_A_WT: psi_A_wt, EXP_A_HT: psi_A_ht,
+            EXP_B_WT: psi_B_wt, EXP_B_HT: psi_B_ht,
+            EXP_C_WT: psi_C_wt, EXP_C_HT: psi_C_ht,
+        }
+
+        for sc_name, (target_exp, direction) in scenarios.items():
+            sim = dk.copy()
+            shift = direction * exp_sds[target_exp]
+            sim[target_exp] = sim[target_exp] + shift
+
+            # Propagate through mediator chain if target is upstream
+            if target_exp in [EXP_A_WT, EXP_A_HT]:
+                sim[EXP_B_WT] = m_bwt.predict(sim)
+                sim[EXP_B_HT] = m_bht.predict(sim)
+                sim[EXP_C_WT] = m_cwt.predict(sim)
+                sim[EXP_C_HT] = m_cht.predict(sim)
+            elif target_exp in [EXP_B_WT, EXP_B_HT]:
+                sim[EXP_C_WT] = m_cwt.predict(sim)
+                sim[EXP_C_HT] = m_cht.predict(sim)
+
+            # Log-TR = Σ ψ_k · Δvel_k  (linear in log-time)
+            log_tr = sum(
+                psi_map[e] * (sim[e].values - dk[e].values)
+                for e in ALL_EXPS if e in sim.columns and e in dk.columns
+            )
+            mc_store[sc_name].append(log_tr.mean())
+
+    # ── Pool ψ estimates via Rubin's rules ────────────────────────────────────
+    def _rubins(vals_vars_sds):
+        """Pool list of (psi, var_psi, sd_exp) tuples. Works for m=1 (no imputation)."""
+        if not vals_vars_sds:
+            return {}
+        psis  = np.array([v[0] for v in vals_vars_sds])
+        vars_ = np.array([v[1] for v in vals_vars_sds])
+        sds   = np.array([v[2] for v in vals_vars_sds])
+        m     = len(psis)
+        psi_bar = psis.mean()
+        sd_bar  = sds.mean()
+        U_bar   = np.nanmean(vars_)
+        B       = np.var(psis, ddof=1) if m > 1 else 0.0
+        T       = U_bar + (1 + 1/m) * B
+        SE      = np.sqrt(max(T, 0))
+        r       = (1 + 1/m) * B / U_bar if (U_bar > 0 and m > 1) else 0.0
+        df_br   = (m - 1) * (1 + 1/r) ** 2 if (m > 1 and r > 0 and np.isfinite(r)) else 999
+        t_val   = psi_bar / SE if SE > 0 else np.nan
+        p_val   = 2 * stats.t.sf(abs(t_val), df=df_br) if not np.isnan(t_val) else np.nan
+        tr_1sd  = np.exp(psi_bar * sd_bar)
+        ci_lo   = np.exp((psi_bar - 1.96 * SE) * sd_bar)
+        ci_hi   = np.exp((psi_bar + 1.96 * SE) * sd_bar)
+        return dict(
+            psi=round(psi_bar, 5), SE_psi=round(SE, 5),
+            TR_1SD=round(tr_1sd, 4),
+            CI_low=round(ci_lo, 4), CI_high=round(ci_hi, 4),
+            P_value=f"{p_val:.4e}" if not np.isnan(p_val) else "NA",
+            Sig=("***" if (not np.isnan(p_val) and p_val < 0.001)
+                 else ("**" if (not np.isnan(p_val) and p_val < 0.01)
+                       else ("*" if (not np.isnan(p_val) and p_val < 0.05) else ""))),
+            N_imp=m,
+        )
+
+    period_map = {
+        EXP_A_WT: "Early infancy",  EXP_A_HT: "Early infancy",
+        EXP_B_WT: "Late infancy",   EXP_B_HT: "Late infancy",
+        EXP_C_WT: "Early childhood",EXP_C_HT: "Early childhood",
+    }
+    meas_map = {e: ("Weight" if "wt" in e else "Height") for e in ALL_EXPS}
+
+    rows = []
+    for exp in ALL_EXPS:
+        d = _rubins(psi_store[exp])
+        if not d:
+            continue
+        rows.append({
+            "Sex": sex_label,
+            "Exposure": exp,
+            "Period": period_map[exp],
+            "Measurement": meas_map[exp],
+            **d,
+            "Interpretation": (
+                "TR<1 → earlier puberty" if d["TR_1SD"] < 1
+                else "TR>1 → later puberty"
+            ),
+        })
+
+    # ── Pool covariate fixed effects via Rubin's rules ────────────────────
+    def _rubins_cov(vals_vars):
+        """Pool list of (beta, var_beta) tuples (no SD scaling — raw log-time scale)."""
+        if not vals_vars:
+            return {}
+        betas = np.array([v[0] for v in vals_vars])
+        vars_ = np.array([v[1] for v in vals_vars])
+        m       = len(betas)
+        b_bar   = betas.mean()
+        U_bar   = np.nanmean(vars_)
+        B       = np.var(betas, ddof=1) if m > 1 else 0.0
+        T       = U_bar + (1 + 1/m) * B
+        SE      = np.sqrt(max(T, 0))
+        r       = (1 + 1/m) * B / U_bar if (U_bar > 0 and m > 1) else 0.0
+        df_br   = (m - 1) * (1 + 1/r) ** 2 if (m > 1 and r > 0 and np.isfinite(r)) else 999
+        t_val   = b_bar / SE if SE > 0 else np.nan
+        p_val   = 2 * stats.t.sf(abs(t_val), df=df_br) if not np.isnan(t_val) else np.nan
+        return dict(
+            Beta=round(b_bar, 5), SE=round(SE, 5),
+            CI_low=round(b_bar - 1.96 * SE, 5),
+            CI_high=round(b_bar + 1.96 * SE, 5),
+            P_value=f"{p_val:.4e}" if not np.isnan(p_val) else "NA",
+            Sig=("***" if (not np.isnan(p_val) and p_val < 0.001)
+                 else ("**" if (not np.isnan(p_val) and p_val < 0.01)
+                       else ("*" if (not np.isnan(p_val) and p_val < 0.05) else ""))),
+            N_imp=m,
+        )
+
+    cov_rows = []
+    for cov, vals in cov_store.items():
+        d = _rubins_cov(vals)
+        if not d:
+            continue
+        cov_rows.append({"Sex": sex_label, "Covariate": cov, **d})
+
+    return pd.DataFrame(rows), mc_store, pd.DataFrame(cov_rows)
+
+
+# ── Run SNAFT for boys and girls ──────────────────────────────────────────────
+print("  Running SNAFT g-estimation for boys …")
+result_boys,  mc_boys,  cov_boys  = run_snaft_sex("Boys",  [df_pooled])
+print("  Running SNAFT g-estimation for girls …")
+result_girls, mc_girls, cov_girls = run_snaft_sex("Girls", [df_pooled])
+
+snaft_results = pd.concat([result_boys, result_girls], ignore_index=True)
+out_snaft = os.path.join(OUTPUT_DIR, "4_snaft_results_com_case.csv")
+snaft_results.to_csv(out_snaft, index=False, encoding="utf-8-sig")
+print(f"  ✓ SNAFT results saved → {out_snaft}")
+print()
+print(snaft_results.to_string(index=False))
+print()
+
+cov_effects = pd.concat([cov_boys, cov_girls], ignore_index=True)
+out_cov = os.path.join(OUTPUT_DIR, "4c_snaft_covariate_effects_com_case.csv")
+cov_effects.to_csv(out_cov, index=False, encoding="utf-8-sig")
+print(f"  ✓ Covariate fixed effects saved → {out_cov}")
+print()
+print(cov_effects.to_string(index=False))
+print()
+
+# ── Summary table: covariate fixed effects on Time Ratio scale ───────────────
+# Beta is on log(puberty_age) scale from AFT full model (Step 1).
+# exp(Beta) = Time Ratio (TR): >1 later puberty, <1 earlier puberty.
+cov_summary = cov_effects.copy()
+cov_summary["TR"]        = np.exp(cov_summary["Beta"])
+cov_summary["TR_CI_low"] = np.exp(cov_summary["CI_low"])
+cov_summary["TR_CI_high"]= np.exp(cov_summary["CI_high"])
+cov_summary["TR_95CI"]   = (
+    cov_summary["TR"].map(lambda x: f"{x:.4f}") + " ("
+    + cov_summary["TR_CI_low"].map(lambda x: f"{x:.4f}") + "–"
+    + cov_summary["TR_CI_high"].map(lambda x: f"{x:.4f}") + ")"
+)
+cov_summary["Interpretation"] = np.where(
+    cov_summary["TR"] < 1, "TR<1 → earlier puberty",
+    np.where(cov_summary["TR"] > 1, "TR>1 → later puberty", "No effect")
+)
+
+display_cols = ["Sex", "Covariate", "Beta", "SE", "TR", "TR_CI_low", "TR_CI_high",
+                "TR_95CI", "P_value", "Sig", "Interpretation", "N_imp"]
+display_cols = [c for c in display_cols if c in cov_summary.columns]
+cov_summary_out = cov_summary[display_cols]
+
+out_cov_summary = os.path.join(OUTPUT_DIR, "4c_snaft_covariate_effects_summary_com_case.csv")
+cov_summary_out.to_csv(out_cov_summary, index=False, encoding="utf-8-sig")
+print(f"  ✓ Covariate fixed effects summary saved → {out_cov_summary}")
+print()
+print("=" * 70)
+print("COVARIATE FIXED EFFECTS SUMMARY (AFT full model, Step 1)")
+print("Beta = log(puberty age) scale  |  TR = exp(Beta) = Time Ratio")
+print("TR > 1 → later puberty onset   |  TR < 1 → earlier puberty onset")
+print("=" * 70)
+for sex in cov_summary_out["Sex"].unique():
+    sub = cov_summary_out[cov_summary_out["Sex"] == sex]
+    print(f"\n  [{sex}]")
+    print(sub[["Covariate", "Beta", "SE", "TR", "TR_95CI", "P_value", "Sig",
+               "Interpretation"]].to_string(index=False))
+print()
+
+
